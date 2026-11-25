@@ -147,6 +147,142 @@ uint32_t advertiseLegacyUuid() {
 } // namespace
 #endif
 
+#if !MICROBIT_CODAL
+#include "MicroBit.h"
+
+// DAL (micro:bit V1) implementation of the same service. The wire protocol
+// is identical to the CODAL service above; the BLE plumbing follows the
+// pattern proven by yokobond/pxt-scratch-more v0.3.2 (MIT) on V1 hardware.
+namespace {
+
+const uint16_t dalServiceUuid = 0xf005;
+const uint8_t dalNotifyUuid[16] = {
+    0x52, 0x61, 0xda, 0x01, 0xfa, 0x7e, 0x42, 0xab,
+    0x85, 0x0b, 0x7c, 0x80, 0x22, 0x00, 0x97, 0xcc
+};
+const uint8_t dalWriteUuid[16] = {
+    0x52, 0x61, 0xda, 0x02, 0xfa, 0x7e, 0x42, 0xab,
+    0x85, 0x0b, 0x7c, 0x80, 0x22, 0x00, 0x97, 0xcc
+};
+
+class ScratchMaqueenServiceDal {
+    static constexpr int packetSize = 20;
+    uint8_t notifyValue[packetSize] = {};
+    uint8_t writeValue[packetSize] = {};
+    int16_t slots[4] = {};
+    uint8_t pendingDisplay[packetSize] = {};
+    int pendingLength = 0;
+    GattAttribute::Handle_t notifyHandle = 0;
+    GattAttribute::Handle_t writeHandle = 0;
+
+    void resetCommands() {
+        memset(slots, 0, sizeof(slots));
+        pendingLength = 0;
+    }
+
+    bool connected() {
+        return uBit.ble && uBit.ble->gap().getState().connected;
+    }
+
+public:
+    ScratchMaqueenServiceDal() {
+        GattCharacteristic notifyChr(
+            dalNotifyUuid, notifyValue, 0, packetSize,
+            GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ |
+                GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY);
+        GattCharacteristic writeChr(
+            dalWriteUuid, writeValue, 0, packetSize,
+            GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_WRITE |
+                GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_WRITE_WITHOUT_RESPONSE);
+        notifyChr.requireSecurity(SecurityManager::MICROBIT_BLE_SECURITY_LEVEL);
+        writeChr.requireSecurity(SecurityManager::MICROBIT_BLE_SECURITY_LEVEL);
+
+        GattCharacteristic *characteristics[] = {&notifyChr, &writeChr};
+        GattService service(dalServiceUuid, characteristics,
+                            sizeof(characteristics) / sizeof(GattCharacteristic *));
+        uBit.ble->addService(service);
+        notifyHandle = notifyChr.getValueHandle();
+        writeHandle = writeChr.getValueHandle();
+        uBit.ble->gattServer().write(notifyHandle, notifyValue, packetSize);
+
+        const uint16_t uuid16List[] = {dalServiceUuid};
+        uBit.ble->gap().accumulateAdvertisingPayload(
+            GapAdvertisingData::INCOMPLETE_LIST_16BIT_SERVICE_IDS,
+            (uint8_t *)uuid16List, sizeof(uuid16List));
+
+        uBit.ble->onDataWritten(this, &ScratchMaqueenServiceDal::onDataWritten);
+        uBit.messageBus.listen(MICROBIT_ID_BLE, MICROBIT_BLE_EVT_CONNECTED, this,
+                               &ScratchMaqueenServiceDal::onConnected,
+                               MESSAGE_BUS_LISTENER_IMMEDIATE);
+        uBit.messageBus.listen(MICROBIT_ID_BLE, MICROBIT_BLE_EVT_DISCONNECTED, this,
+                               &ScratchMaqueenServiceDal::onDisconnected,
+                               MESSAGE_BUS_LISTENER_IMMEDIATE);
+    }
+
+    void onConnected(MicroBitEvent) { resetCommands(); }
+    void onDisconnected(MicroBitEvent) { resetCommands(); }
+
+    void onDataWritten(const GattWriteCallbackParams *params) {
+        if (params->handle != writeHandle || params->len == 0 ||
+            params->len > packetSize) {
+            return;
+        }
+        const uint8_t *data = params->data;
+        if (data[0] == 0xa0 && params->len == 4) {
+            const unsigned slot = data[1];
+            const int word = data[2] | (data[3] << 8);
+            const int value = word >= 0x8000 ? word - 0x10000 : word;
+            if (slot < 2) {
+                slots[slot] = value;
+            } else if (slot == 3) {
+                slots[3] = value & 0x0c;
+            }
+        } else if (data[0] == 0x81 || (data[0] == 0x82 && params->len == 6)) {
+            memcpy(pendingDisplay, data, params->len);
+            pendingLength = params->len;
+        }
+    }
+
+    int command(int slot) {
+        return slot >= 0 && slot < 4 && connected() ? slots[slot] : 0;
+    }
+
+    void publish(pxt::Buffer frame) {
+        if (!connected() || frame->length != packetSize) {
+            return;
+        }
+        uBit.ble->gattServer().notify(notifyHandle, frame->data, packetSize);
+
+        // Run display work in the MakeCode fiber instead of the BLE callback.
+        const int len = pendingLength;
+        if (len == 0) {
+            return;
+        }
+        uint8_t command[packetSize];
+        memcpy(command, pendingDisplay, len);
+        pendingLength = 0;
+        auto &display = uBit.display;
+        display.stopAnimation();
+        if (command[0] == 0x81) {
+            char text[packetSize];
+            memcpy(text, command + 1, len - 1);
+            text[len - 1] = '\0';
+            display.scrollAsync(ManagedString(text), 120);
+        } else {
+            for (int y = 0; y < 5; ++y) {
+                for (int x = 0; x < 5; ++x) {
+                    display.image.setPixelValue(x, y, (command[y + 1] & (1 << x)) ? 255 : 0);
+                }
+            }
+        }
+    }
+};
+
+ScratchMaqueenServiceDal *dalService = nullptr;
+
+} // namespace
+#endif
+
 namespace LegacyBle {
 
 //%
@@ -156,6 +292,11 @@ int start() {
         service = new ScratchMaqueenService();
     }
     return advertiseLegacyUuid();
+#elif !MICROBIT_CODAL
+    if (!dalService) {
+        dalService = new ScratchMaqueenServiceDal();
+    }
+    return 0;
 #else
     return -1;
 #endif
@@ -165,6 +306,8 @@ int start() {
 int command(int slot) {
 #if MICROBIT_CODAL && CONFIG_ENABLED(DEVICE_BLE)
     return service ? service->command(slot) : 0;
+#elif !MICROBIT_CODAL
+    return dalService ? dalService->command(slot) : 0;
 #else
     return 0;
 #endif
@@ -175,6 +318,10 @@ void publish(pxt::Buffer frame) {
 #if MICROBIT_CODAL && CONFIG_ENABLED(DEVICE_BLE)
     if (service) {
         service->publish(frame);
+    }
+#elif !MICROBIT_CODAL
+    if (dalService) {
+        dalService->publish(frame);
     }
 #endif
 }
